@@ -15,17 +15,140 @@ const statusToNaturalLanguage = {
 // Store loaded leaderboards to avoid re-rendering
 const loadedLeaderboards = new Set();
 let leaderboardData = null;
+let rowMarkersData = null;
+let checkedMarker = { symbol: '✅', image: './img/SI2_Logo_Circle_White.png', title: 'Evaluated by Si2' };
 
 const sortState = { field: 'resolved_full', direction: 'desc' };
 
+const COLUMN_TOOLTIPS = {
+    resolved_full: 'Pass rate (problems passed / problems attempted) across open-source and commercial simulator runs. Shown as “-” when a commercial simulator was unavailable.',
+    resolved_oss: 'Pass rate (problems passed / problems attempted) on open-source (OSS) simulator dataset runs.',
+    cost: 'Average cost per test in USD. If it costs $C to run 5 samples across 800 tests, this value is C/(5 × 800). Shown as “-” when cost is unavailable.'
+};
+
+const HEX_COLOR = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function loadJsonScript(elementId) {
+    const dataScript = document.getElementById(elementId);
+    if (!dataScript) {
+        return null;
+    }
+    return JSON.parse(dataScript.textContent);
+}
+
 function loadLeaderboardData() {
     if (!leaderboardData) {
-        const dataScript = document.getElementById('leaderboard-data');
-        if (dataScript) {
-            leaderboardData = JSON.parse(dataScript.textContent);
-        }
+        leaderboardData = loadJsonScript('leaderboard-data');
     }
     return leaderboardData;
+}
+
+function loadRowMarkersData() {
+    if (!rowMarkersData) {
+        rowMarkersData = loadJsonScript('row-markers-data') || { markers: [], entries: {} };
+        const loadedCheckedMarker = loadJsonScript('checked-marker-data');
+        if (loadedCheckedMarker && loadedCheckedMarker.symbol && loadedCheckedMarker.title) {
+            checkedMarker = loadedCheckedMarker;
+        }
+    }
+    return rowMarkersData;
+}
+
+function getRowMarkerMap(rowMarkers) {
+    const markers = Array.isArray(rowMarkers.markers) ? rowMarkers.markers : [];
+    const markerMap = {};
+    markers.forEach(marker => {
+        if (marker && marker.id) {
+            markerMap[marker.id] = marker;
+        }
+    });
+    return markerMap;
+}
+
+function renderInfoMarker(symbol, title, color, markerId, image) {
+    const safeTitle = escapeHtml(title);
+    if (image) {
+        return `<img class="info-marker info-marker-image" src="${escapeHtml(image)}" alt="${safeTitle}" title="${safeTitle}" />`;
+    }
+    const safeSymbol = escapeHtml(symbol);
+    const hasColor = HEX_COLOR.test(color || '');
+    const colorAttr = hasColor ? ` style="color: ${color};"` : '';
+    const classes = ['info-marker'];
+    if (hasColor) {
+        classes.push('info-marker-symbol');
+    }
+    if (markerId === 'asterisk') {
+        classes.push('info-marker-asterisk');
+    }
+    if (markerId === 'triangle') {
+        classes.push('info-marker-triangle');
+    }
+    return `<span class="${classes.join(' ')}" title="${safeTitle}"${colorAttr}>${safeSymbol}</span>`;
+}
+
+function renderRowMarkers(item) {
+    if (item.checked) {
+        return renderInfoMarker(checkedMarker.symbol, checkedMarker.title, undefined, undefined, checkedMarker.image);
+    }
+
+    const rowMarkers = loadRowMarkersData();
+    const markerMap = getRowMarkerMap(rowMarkers);
+    const entry = rowMarkers.entries && rowMarkers.entries[item.id];
+    if (!entry || !Array.isArray(entry.markers)) {
+        return '';
+    }
+
+    return entry.markers.map(markerName => {
+        const marker = markerMap[markerName];
+        if (!marker) {
+            return '';
+        }
+        return renderInfoMarker(marker.symbol, marker.title, marker.color, marker.id, marker.image);
+    }).join('');
+}
+
+function renderMarkerLegend() {
+    const legend = document.getElementById('marker-legend');
+    if (!legend) {
+        return;
+    }
+
+    const rowMarkers = loadRowMarkersData();
+    const catalog = Array.isArray(rowMarkers.markers) ? rowMarkers.markers : [];
+    const legendItems = [
+        checkedMarker,
+        ...catalog
+    ];
+
+    legend.innerHTML = legendItems.map(marker => `
+        <span class="marker-legend-item">${renderInfoMarker(marker.symbol, marker.title, marker.color, marker.id, marker.image)}<span>${escapeHtml(marker.title)}</span></span>
+    `).join('');
+}
+
+function getLogsTrajsValue(item) {
+    return item["logs/trajs"] || item.logs || item.trajs || '';
+}
+
+function renderResolvedCell(value, logsTrajsUrl) {
+    const formattedValue = cleanNum(value);
+    if (formattedValue === "-") {
+        return '<span class="number fw-medium text-primary">-</span>';
+    }
+
+    const content = `<span class="number fw-medium text-primary">${formattedValue}</span>`;
+    if (!logsTrajsUrl) {
+        return content;
+    }
+
+    return `<a href="${logsTrajsUrl}" target="_blank" rel="noopener noreferrer" title="Open logs/trajectories">${content}</a>`;
 }
 
 function sortItems(a, b, field, direction) {
@@ -43,12 +166,10 @@ function sortItems(a, b, field, direction) {
                 return getOrgName(item);
             case 'date':
                 return item.date || '';
-            case 'logs':
-            case 'trajs':
             case 'site':
                 return item[field] ? 1 : 0;
             case 'release':
-                return (item['mini-swe-agent_version'] || '').toLowerCase();
+                return item.release || '';
             default:
                 return '';
         }
@@ -82,12 +203,19 @@ function getDefaultSortDirection(field) {
     return textFields.includes(field) ? 'asc' : 'desc';
 }
 
+const cleanNum = (val) => {
+    // If it's null, undefined, the string "NaN", or mathematically NaN
+    if (val === null || val === undefined || val === "NaN" || isNaN(parseFloat(val))) {
+        return "-";
+    }
+    return parseFloat(val).toFixed(2);
+};
+
 function renderLeaderboardTable(leaderboard) {
     const container = document.getElementById('leaderboard-container');
     // const isBashOnly = leaderboard.name.toLowerCase() === 'code-generation-limited-context';
     
     const results = leaderboard.results
-        .filter(item => !item.warning)
         .slice()
         .sort((a, b) => sortItems(a, b, sortState.field, sortState.direction));
 
@@ -99,13 +227,13 @@ function renderLeaderboardTable(leaderboard) {
                     <thead>
                         <tr>
                             <th class="sortable" data-sort="name">Model</th>
-                            <th class="sortable" data-sort="resolved_full">% Resolved Full</th>
-                            <th class="sortable" data-sort="resolved_oss">% Resolved OSS</th>
+                            <th class="sortable has-col-tooltip" data-sort="resolved_full" data-tooltip="${escapeHtml(COLUMN_TOOLTIPS.resolved_full)}">% Resolved Full</th>
+                            <th class="sortable has-col-tooltip" data-sort="resolved_oss" data-tooltip="${escapeHtml(COLUMN_TOOLTIPS.resolved_oss)}">% Resolved OSS</th>
                             <th class="sortable" data-sort="org">Org</th>
-                            <th class="sortable" data-sort="cost">Cost</th>
+                            <th class="sortable has-col-tooltip" data-sort="cost" data-tooltip="${escapeHtml(COLUMN_TOOLTIPS.cost)}">Avg. $</th>
                             <th class="sortable" data-sort="date">Date</th>
-                            <th class="sortable" data-sort="logs">Logs</th>
-                            <th class="sortable" data-sort="trajs">Trajs</th>
+                            <th class="sortable" data-sort="notes">Notes</th>
+                            <th>Logs/Trajs</th>
                             <th class="sortable" data-sort="site">Site</th>
                             <th class="sortable" data-sort="release">Release</th>
                         </tr>
@@ -116,37 +244,44 @@ function renderLeaderboardTable(leaderboard) {
                                     data-checked="${item.checked ? 'true' : 'false'}"
                                     data-tags="${item.tags ? item.tags.join(',') : ''}"
                                     data-name="${item.name}"
+                                    data-release="${item.release || ''}"
                                 >
                                     <td>
                                         <div class="flex items-center gap-1">
                                             <div class="model-badges">
-                                                ${item.checked ? '<span title="The agent run was performed by or directly verified by the LBC-bench team">✅</span>' : ''}
+                                                ${renderRowMarkers(item)}
                                             </div>
                                             <span class="model-name font-mono fw-medium">${item.name}</span>
                                         </div>
                                     </td>
-                                    <td><span class="number fw-medium text-primary">${parseFloat(item.resolved_full).toFixed(2)}</span></td>
-                                    <td><span class="number fw-medium text-primary">${parseFloat(item.resolved_oss).toFixed(2)}</span></td>
-                                    <td>
+                                    <td class="centered-text text-center">${renderResolvedCell(item.resolved_full, getLogsTrajsValue(item))}</td>
+                                    <td class="centered-text text-center">${renderResolvedCell(item.resolved_oss, getLogsTrajsValue(item))}</td>
+                                    <td class="centered-text text-center">
                                         ${item.logo && item.logo.length > 0 ? `
                                             <div style="display: flex; align-items: center;">
                                                 ${item.logo.map(logoUrl => `<img src="${logoUrl}" style="height: 1.5em;" />`).join('')}
                                             </div>
                                         ` : '-'}
                                     </td>
-                                    <td><span class="number fw-medium text-primary">${parseFloat(item.cost).toFixed(2)}</span></td>
-                                    <td><span class="label-date text-muted">${item.date}</span></td>
+                                    <td class="centered-text text-center"><span class="number fw-medium text-primary">${cleanNum(item.cost)}</span></td>
+                                    <td class="centered-text text-center"><span class="label-date text-muted">${item.date}</span></td>
                                     <td class="centered-text text-center">
-                                        ${item.logs ? '<span class="text-success">✓</span>' : '<span class="text-muted">-</span>'}
+                                        ${item.notes ? 
+                                            `<a href="#" data-popup-text="${item.notes}" onclick="openPopup(this); return false;">📝</a>`
+                                            : '<span class="text-muted">-</span>'}
                                     </td>
                                     <td class="centered-text text-center">
-                                        ${item.trajs ? '<span class="text-success">✓</span>' : '<span class="text-muted">-</span>'}
+                                        ${getLogsTrajsValue(item)
+                                            ? `<a href="${getLogsTrajsValue(item)}" target="_blank" rel="noopener noreferrer" title="Open logs/trajectories">🔗</a>`
+                                            : '<span class="text-muted">-</span>'}
                                     </td>
                                     <td class="centered-text text-center">
                                         ${item.site ? `<a href="${item.site}" target="_blank" rel="noopener noreferrer"><i class="fas fa-external-link-alt"></i></a>` : '<span class="text-muted">-</span>'}
                                     </td>
-                                    <td><span class="text-muted font-mono">-</span></td>
-                                </tr>
+                                    <td class="centered-text text-center">
+                                        ${item.release ? `<span class="text-success">${item.release}</span>` : '<span class="text-muted">-</span>'}
+                                    </td>                         
+                                    </tr>
                             `).join('')}
                         <tr class="no-results" style="display: none;">
                             <td colspan="10" class="text-center">
@@ -178,6 +313,7 @@ function attachSortHandlers(leaderboardName) {
 }
 
 function handleSortClick(header, leaderboardName) {
+    hideColumnTooltip();
     const field = header.getAttribute('data-sort');
     
     if (sortState.field === field) {
@@ -187,12 +323,50 @@ function handleSortClick(header, leaderboardName) {
         sortState.direction = getDefaultSortDirection(field);
     }
     
-    const data = loadLeaderboardData();
-    if (!data) return;
+    // DOM-based sorting - sort visible rows only
+    const container = document.getElementById('leaderboard-container');
+    const tableWrapper = container.querySelector(`#leaderboard-${leaderboardName}`);
+    if (!tableWrapper) return;
     
-    const leaderboard = data.find(lb => lb.name === leaderboardName);
-    if (leaderboard) {
-        renderLeaderboardTable(leaderboard);
+    const tbody = tableWrapper.querySelector('tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr:not(.no-results)'));
+    
+    // Sort the visible rows
+    rows.sort((a, b) => {
+        const aValue = getSortValue(a, field);
+        const bValue = getSortValue(b, field);
+        
+        let comparison = 0;
+        if (aValue < bValue) comparison = -1;
+        else if (aValue > bValue) comparison = 1;
+        
+        return sortState.direction === 'asc' ? comparison : -comparison;
+    });
+    
+    // Re-append sorted rows to maintain order
+    rows.forEach(row => tbody.appendChild(row));
+    
+    updateSortIndicators();
+}
+
+function getSortValue(row, field) {
+    switch (field) {
+        case 'name':
+            return (row.getAttribute('data-name') || '').toLowerCase();
+        case 'resolved_full':
+            return parseFloat(row.querySelector('td:nth-child(2) .number').textContent) || 0;
+        case 'resolved_oss':
+            return parseFloat(row.querySelector('td:nth-child(3) .number').textContent) || 0;
+        case 'cost':
+            return parseFloat(row.querySelector('td:nth-child(5) .number').textContent) || 0;
+        case 'date':
+            return row.querySelector('td:nth-child(6) .label-date').textContent || '';
+        case 'site':
+            return row.querySelector('td:nth-child(9) a') ? 1 : 0;
+        case 'release':
+            return row.querySelector('td:nth-child(10) span').textContent || '';
+        default:
+            return '';
     }
 }
 
@@ -316,7 +490,78 @@ function openLeaderboard(leaderboardName) {
     }
 }
 
+function getColumnTooltipEl() {
+    let tooltipEl = document.getElementById('col-header-tooltip');
+    if (!tooltipEl) {
+        tooltipEl = document.createElement('div');
+        tooltipEl.id = 'col-header-tooltip';
+        tooltipEl.className = 'col-header-tooltip';
+        tooltipEl.setAttribute('role', 'tooltip');
+        document.body.appendChild(tooltipEl);
+    }
+    return tooltipEl;
+}
+
+function hideColumnTooltip() {
+    const tooltipEl = document.getElementById('col-header-tooltip');
+    if (tooltipEl) {
+        tooltipEl.classList.remove('visible');
+    }
+}
+
+function showColumnTooltip(anchor, text) {
+    const tooltipEl = getColumnTooltipEl();
+    tooltipEl.textContent = text;
+    tooltipEl.classList.add('visible');
+
+    const rect = anchor.getBoundingClientRect();
+    const tipRect = tooltipEl.getBoundingClientRect();
+    const pad = 8;
+    let left = rect.left + rect.width / 2;
+    const half = tipRect.width / 2;
+    if (left - half < pad) {
+        left = half + pad;
+    }
+    if (left + half > window.innerWidth - pad) {
+        left = window.innerWidth - pad - half;
+    }
+    tooltipEl.style.left = `${left}px`;
+    tooltipEl.style.top = `${rect.bottom + 8}px`;
+}
+
+function initColumnTooltips() {
+    const container = document.getElementById('leaderboard-container');
+    if (!container || container.dataset.tooltipBound === 'true') {
+        return;
+    }
+    container.dataset.tooltipBound = 'true';
+
+    container.addEventListener('mouseover', (event) => {
+        const header = event.target.closest('th.has-col-tooltip');
+        if (!header) {
+            return;
+        }
+        const text = header.getAttribute('data-tooltip');
+        if (text) {
+            showColumnTooltip(header, text);
+        }
+    });
+
+    container.addEventListener('mouseout', (event) => {
+        const header = event.target.closest('th.has-col-tooltip');
+        if (!header || header.contains(event.relatedTarget)) {
+            return;
+        }
+        hideColumnTooltip();
+    });
+
+    container.addEventListener('scroll', hideColumnTooltip, true);
+    window.addEventListener('scroll', hideColumnTooltip, true);
+}
+
 document.addEventListener('DOMContentLoaded', function() {
+    renderMarkerLegend();
+    initColumnTooltips();
     const currentPath = window.location.pathname;
     const currentPage = currentPath.split('/').pop().split('.')[0] || 'index';
     
